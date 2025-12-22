@@ -1,0 +1,477 @@
+#region 1 - Synopsis
+<#
+.DESCRIPTION
+    Scheduled Powershell script that contains logic for custom triggers for Lifecycle Workflows
+.NOTES
+    Author: Andrew Bowen
+    Updated: 08/19/2025
+
+.HISTORY
+    08/19/2025 - AB - Initial script creation
+
+.EXAMPLE
+    Interactive mode
+    .\schedule_custom_lifecycle_worlflow_triggers.ps1
+
+    Automated mode
+    .\schedule_custom_lifecycle_worlflow_triggers.ps1 -AutoRun 1
+
+    Managed Identity Auth mode
+    .\schedule_custom_lifecycle_worlflow_triggers.ps1 -ManagedIdentity 1
+#>
+# To use with automation
+Param(
+    [string]$ManagedIdentity,
+    [string]$AutoRun
+)
+
+#region 2 - Variables
+#Variables
+# Entra ID Application Connection information
+# Certificate thumbprint
+$certThumb = ${certificate_thumbprint}
+# App registration Application ID
+$appID = ${app_registration_id}
+# Entra Tenant ID
+$tenatID = ${tenant_id}
+
+# Name of folder to store logs in
+# Set path in $env:SCRIPTS_LOG_PATH or default is $Home\$logFolder
+$logFolder = "CustomLifecycleTriggers"
+
+# Log files to keep in days
+$KeepLogFiles = 30
+
+# Script title
+$title = "Custom Lifecycle Workflow Triggers"
+
+# DO NOT EDIT BELOW THIS LINE
+#_________________________________________________________________________________________________________________________________
+#region 3 - Prerequisties
+
+<#
+Create new Entra ID app registration
+    Certificate & secrets
+        Add the CER file from the certificate generated below
+    API Permissions
+        Microsoft Graph
+            Application.Read.All (Type = Application)
+            User.Read.All (Type = Application)
+
+#>
+
+# Create new certificate using these commands
+<#
+$certname = "EntraProvision_EI2WD_Writeback" 
+$cert = New-SelfSignedCertificate -Subject "CN=$certname" -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -KeySpec Signature -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256
+Export-Certificate -Cert $cert -FilePath "$certname.cer"   ## Export the certificate for Azure
+$mypwd = Read-Host "Specify the password for the PFX file" -AsSecureString
+Export-PfxCertificate -Cert $cert -FilePath "$certname.pfx" -Password $mypwd   ## Export the certificate to install on other endpoints for authentication
+#>
+# Remember to delete the certificate with the exportable private key when you are done
+
+# Add Graph API Permissions to Managed Identity
+<#
+# Connect to Microsoft Graph
+Connect-MgGraph -Scopes "Application.Read.All","AppRoleAssignment.ReadWrite.All,RoleManagement.ReadWrite.Directory"
+$managedIdentityId = ""
+$graphApp = Get-MgServicePrincipal -Filter "AppId eq '00000003-0000-0000-c000-000000000000'"
+
+$graphScopes = @(
+  'UserAuthenticationMethod.Read.All',
+  'LifecycleWorkflows.ReadWrite.All',
+  'Group.ReadWrite.All',
+  'Directory.Read.All',
+  'User.ReadWrite.All'
+)
+
+ForEach($scope in $graphScopes){
+  $appRole = $graphApp.AppRoles | Where-Object {$_.Value -eq $scope}
+  New-MgServicePrincipalAppRoleAssignment -PrincipalId $managedIdentityId -ServicePrincipalId $managedIdentityId -ResourceId $graphApp.Id -AppRoleId $appRole.Id
+}
+#>
+
+# Error Codes
+<#
+
+8000 = log file directory missing
+8001 = powershell module import failure
+8002 = certificate not found
+8003 = certificate expired
+#>
+
+# Script variables
+$global:userUPN = $null
+$global:exitCode = 1
+$global:errorTracking = $null
+
+if($AutoRun -ne 1){ Clear-Host }
+Write-Output ""
+Write-Output "Loading the $title Script..."
+
+# Setting the PowerShell title
+if($AutoRun -ne 1){
+    $Host.UI.RawUI.WindowTitle = $title
+    # Setting the domain controller
+    $global:dcName = $($env:LOGONSERVER).Replace("\","")
+}
+
+# Log file management
+if($env:SCRIPTS_LOG_PATH){
+    $LogPath = "$env:SCRIPTS_LOG_PATH\\$logFolder\\Logs"
+    $SupportPath = "$env:SCRIPTS_LOG_PATH\\$logFolder"
+} else {
+    $LogPath = "$Home\\Downloads"
+    $SupportPath = "$Home\\Downloads"
+}
+
+if(!(Test-Path -Path $LogPath)){
+    if($AutoRun -eq 1){
+            Write-Output "Log file path not found: $LogPath"
+            Write-Error "Log file path not found: $LogPath" -ErrorAction Stop
+    }else{
+            Write-Error "Log file path $LogPath not found, aborting..."
+            Write-Output ""
+            Read-Host "Press enter to continue"
+            exit 8000
+    }
+}
+if($AutoRun -eq 1){
+    $LogFile = $LogPath + "\" + $((Get-Date).ToString("s").Replace(":","-")) + "_AutoRun" +  "_log.txt"
+}else{
+    $LogFile = $LogPath + "\" + $((Get-Date).ToString("s").Replace(":","-")) + "_" + $env:USERNAME + "_log.txt"
+}
+
+# Checking if auto run is enabled
+if($AutoRun -eq 1){
+    Write-Output ""
+    $textOutput = "======== Automation has been enabled ========"
+    Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+    Write-Output $textOutput
+}
+
+Set-Content -Path $LogFile -Value "Script Started $((Get-Date).ToString("s").Replace(":","-"))"
+Add-Content -Path $LogFile -Value ""
+Add-Content -Path $LogFile -Value "Username: $env:USERNAME"
+Add-Content -Path $LogFile -Value "Computer: $env:COMPUTERNAME"
+if($AutoRun -ne 1){ Add-Content -Path $LogFile -Value "Domain Controller: $global:dcName" }
+Add-Content -Path $LogFile -Value "Parameters: "
+$paramString = $PSBoundParameters.GetEnumerator() | ForEach-Object {
+    " - $($_.Key): $($_.Value)"
+} | Out-String
+Add-Content -Path $LogFile -Value $paramString
+Add-Content -Path $LogFile -Value ""
+# Clean up log files
+$limit = (Get-Date).AddDays(-$KeepLogFiles)
+Write-Output ""
+Write-Output "Cleaned up log files older than $KeepLogFiles"
+Get-ChildItem -Path "$LogPath\*_log.txt" -File -Recurse | Where-Object { $_.LastWriteTime -lt $limit } | ForEach-Object {
+    $textOutput = "Removing $($_.FullName)"
+    Write-Output $textOutput
+    Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+	Remove-Item -Path "$($_.FullName)"
+}
+
+if($ManagedIdentity -ne 1){
+    Write-Output ""
+    Write-Output "Checking application certificate"
+    $certInfo = (((Get-ChildItem -Path Cert:\LocalMachine\My -SSLServerAuthentication) | Where-Object Thumbprint -eq $certThumb))
+    if(!($certInfo)){
+        $certInfo = (((Get-ChildItem -Path Cert:\CurrentUser\My -SSLServerAuthentication) | Where-Object Thumbprint -eq $certThumb))
+    }
+
+    if($certInfo){
+        $certExpiration = [datetime]$($certInfo.NotAfter)
+
+        $curTime = (Get-Date)
+        $certDaysLeftRaw = [string]$($(New-TimeSpan -Start $curTime -End $certExpiration).TotalDays)
+        $certDaysLeftClean = $($certDaysLeftRaw.Split("."))[0]
+        if([int]$certDaysLeftRaw -le 30){
+            $textOutput = "Application certificate will expire in $certDaysLeftClean"
+            Write-Warning $textOutput
+            Add-Content -Path $LogFile -Value $textOutput
+
+        }elseif([int]$certDaysLeftRaw -le 0){
+            $textOutput = "Application certificate expired on $certExpiration, aborting..."
+            Write-Error $textOutput
+            Add-Content -Path $LogFile -Value $textOutput
+            Write-Output ""
+            Write-Output "Press enter to continue"
+            $global:errorTracking = $textOutput
+            $global:exitCode = 8003
+            exit $global:exitCode
+        }else{
+            $textOutput = "Certifcate is good for $certDaysLeftClean days"
+            Write-Output $textOutput
+            Add-Content -Path $LogFile -Value $textOutput
+        }
+    }else{
+        $textOutput = "Application certificate not found, aborting..."
+        Write-Error $textOutput
+        Add-Content -Path $LogFile -Value $textOutput
+        Write-Output ""
+        Write-Output "Press enter to continue"
+        $global:errorTracking = $textOutput
+        $global:exitCode = 8002
+        exit $global:exitCode
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+# Module handling
+Write-Output ""
+$requiredModules = @("Microsoft.Graph.Applications","Microsoft.Graph.Users","ActiveDirectory", "Microsoft.Graph.Identity.Governance")
+foreach ($module in $requiredModules) {
+    if (Get-Module -Name $module -ListAvailable) {
+        $textOutput = "Importing $module PowerShell module"
+        Write-Output $textOutput
+        Add-Content -Path $LogFile -Value $textOutput
+        Import-Module -Name $module -ErrorAction Stop
+    } else {
+        $textOutput = "$module module missing, installing"
+        Write-Output $textOutput
+        # Check admin privileges
+        if (-NOT (New-Object Security.Principal.WindowsPrincipal $([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
+            $textOutput = "Insufficient permissions to install the required PowerShell modules, run the script again as admin"
+            Write-Warning $textOutput
+            Add-Content -Path $LogFile -Value $textOutput
+            $global:errorTracking = $textOutput
+            $global:exitCode = 8001
+            Write-Output ""
+            if($AutoRun -ne "1"){Read-Host "Press enter to continue"}
+            exit $global:exitCode
+        } else {
+            Install-Module -Name $module -Force -Confirm:$false -Scope CurrentUser -ErrorAction Stop -AllowClobber
+        }
+    }
+}
+
+#region - 4 - Functions
+
+#region - Graph Connections
+function connectGraph(){
+    # Connect to Microsoft Graph API
+    if($ManagedIdentity -eq 1){
+        try {
+            Connect-MgGraph -Identity -NoWelcome  
+        }
+        catch {
+                $textOutput = "Failed to connect to Graph through Managed Identity: $_"
+                Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+                Write-Output $textOutput
+                $global:errorTracking = $textOutput
+                $global:exitCode = 8004
+                Write-Output ""
+                leaveScript
+                if($AutoRun -ne "1"){Read-Host "Press enter to continue"}
+        }
+    }else {
+        try {
+            Connect-MgGraph -ClientId $appID -TenantId $tenatID -CertificateThumbprint $certThumb -NoWelcome -ErrorAction Stop   
+        }
+        catch {
+                $textOutput = "Failed to connect to Graph: $_"
+                Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+                Write-Output $textOutput
+                $global:errorTracking = $textOutput
+                $global:exitCode = 8004
+                Write-Output ""
+                leaveScript
+                if($AutoRun -ne "1"){Read-Host "Press enter to continue"}
+        }
+    }
+}
+
+function disconnectGraph(){
+    Disconnect-MgGraph | Out-Null
+}
+
+#region - leaveScript
+function leaveScript(){
+    disconnectGraph
+
+    Add-Content -Path $LogFile -Value "Script Finished $((Get-Date).ToString("s").Replace(":","-"))"
+    Add-Content -Path $LogFile -Value ""
+    if($global:errorTracking){
+        $finalMessage = $global:errorTracking + " [Exit code: $global:exitCode] ($LogFile)"
+        Add-Content -Path $LogFile -Value "Exit Code $global:exitCode"
+
+        if($AutoRun -ne "1"){
+            Write-Error -Message "$finalMessage"
+            exit $global:exitCode
+        }else {
+            Write-Output -Message $finalMessage
+            Write-Error -Message $global:errorTracking -ErrorAction Stop
+        }
+        
+    }else{
+        Add-Content -Path $LogFile -Value "Exit Code 0"
+        exit 0
+    }
+}
+
+#region - checkUser
+function checkUser(){
+    param (
+        [string]$EIuser
+    )
+    Write-Output ""
+    $textOutput = "Checking user exists in Entra ID"
+    Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+    Write-Output $textOutput
+    connectGraph
+    $userEIinfo = Get-MgUser -Filter "userPrincipalName eq '$EIuser'"
+    disconnectGraph
+    if(!$userEIinfo){
+        $textOutput = "User not found in Active Directory: UPN = $global:userUPN"
+        Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+        Write-Output $textOutput -ForegroundColor Red
+        $global:errorTracking = $textOutput
+        $global:exitCode = 1001
+        if($AutoRun -ne "1"){Read-Host "Press enter to continue"}
+        leaveScript
+    }else{
+        $textOutput = " - found"
+        Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+        Write-Output $textOutput
+        $global:userUPN = $userEIinfo.UserPrincipalName
+        triggerWorkflow
+    }
+}
+
+#region - triggerWorkflow
+function triggerWorkflow(){
+    param (
+        [Microsoft.ActiveDirectory.Management.ADUser[]]$Users,
+        [string]$LifeCycleWorkflowID,
+        [string]$LifeCycleWorkflowName,
+        [string]$ProcessingFilePath
+    )
+
+    connectGraph
+    foreach ($user in $Users){
+        $EIuser = $user.UserPrincipalName
+        Write-Output ""
+        $textOutput = "Checking user $EIuser exists in Entra ID"
+        Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+        Write-Output $textOutput
+        
+        $userEIinfo = Get-MgUser -Filter "userPrincipalName eq '$EIuser'"
+        if(!$userEIinfo){
+            $textOutput = " - user not found, skipping"
+            Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+            Write-Output $textOutput
+            return
+        }else{
+            $textOutput = " - found"
+            Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+            Write-Output $textOutput
+            $userId = $userEIinfo.Id
+            
+            $LifeCycleWorkflowParameters = @{
+                subjects = @(
+                    @{
+                        id = "$userId"
+                    }
+                )
+            }
+
+            # Provision employee ID
+            Write-Output ""
+            $textOutput = "Triggering lifecycle $LifeCycleWorkflowName for user $global:userUPN, please wait..."
+            Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+            Write-Output $textOutput 
+            try {
+                $cmdResults = Initialize-MgIdentityGovernanceLifecycleWorkflow -WorkflowId $LifeCycleWorkflowID -BodyParameter $LifeCycleWorkflowParameters
+
+                Write-Output ""
+                $textOutput = "Success"
+                Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+                Write-Output $textOutput
+
+                Add-Content -Path $ProcessingFilePath -Value "$($user.EmployeeID),$($user.DisplayName),$($user.extensionAttribute6)"
+            } catch {
+                $textOutput = "Operation failed: $_"
+                Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+                Write-Error $textOutput
+            }
+        }
+    }
+    disconnectGraph
+}
+
+#region - processFile
+function processFile(){
+    param (
+        [string]$filePath,
+        [string]$attribute1,
+        [string]$attribute2
+    )
+    $users = Import-Csv -Path $filePath
+
+    $filtered = foreach($user in $users){
+        $userEID = $user.EmployeeID
+        $adUser = Get-ADUser -Filter { EmployeeID -eq $userEID } -Properties EmployeeID, $attribute1, $attribute2
+
+        if($adUser.$attribute1 -eq $adUser.$attribute2){
+            continue
+        }
+        if($adUser.$attribute1 -ne $user.$attribute1 -or $adUser.$attribute2 -ne $user.$attribute2){
+            continue
+        }
+
+        $user
+    }
+    
+    $filtered | Export-Csv $filePath -NoTypeInformation
+}
+
+#region 5 - Custom Triggers
+
+# Detect when Name Change Lifecycle is necessary
+# Logic - When DisplayName (On Create only) not equal extensionAttribute6 (Live Update),
+# name change occurred in Workday
+function nameChangeTrigger(){
+    $textOutput = "Checking Name Change custom trigger, please wait..."
+    Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+    Write-Output $textOutput 
+
+    $NAMECHANGE_LIFECYCLE_ID = "${name_change_lifecycle_id}"
+    $NAMECHANGE_LIFECYCLE_NAME = "Mover - Name Change Detection"
+    $NAMECHANGE_PROCESS_FILEPATH = "$SupportPath\\name_change_processing.csv"
+
+    $users = Get-ADUser -Filter { Enabled -eq $true -and EmployeeID -like "*" } -Properties EmployeeID, WhenChanged, DisplayName, CN, UserPrincipalName, extensionAttribute6|
+    Where-Object { 
+        $_.DisplayName -ne $_.extensionAttribute6 -and $_.extensionAttribute6
+    }
+
+    foreach($user in $users){
+        $processedUsers = Import-Csv -Path $NAMECHANGE_PROCESS_FILEPATH
+        if($processedUsers.EmployeeID -notcontains $user.EmployeeID){
+            $usersToProcess += $user
+        }
+    }
+
+    if($usersToProcess){
+        $count = $usersToProcess.Count
+        $textOutput = "Found $count users through custom trigger, triggering lifecycle $NAMECHANGE_LIFECYCLE_NAME"
+        Add-Content -Path $LogFile -Value "$((Get-Date).ToString("s").Replace(":","-")): $textOutput"
+        Write-Output $textOutput
+
+        triggerWorkflow -Users $usersToProcess -LifeCycleWorkflowID $NAMECHANGE_LIFECYCLE_ID -LifeCycleWorkflowName $NAMECHANGE_LIFECYCLE_NAME -ProcessingFilePath $NAMECHANGE_PROCESS_FILEPATH
+    }
+    
+    processFile -filePath $NAMECHANGE_PROCESS_FILEPATH -attribute1 "DisplayName" -attribute2 "extensionAttribute6"
+}
+
+#region 6 - Start Script
+
+# Check if the script should run automatically
+if($AutoRun -eq "1"){
+    nameChangeTrigger
+
+    leaveScript
+}
+
+
+#endregion
